@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/build/
+/build-fd/
+/build-gui/
+/package/

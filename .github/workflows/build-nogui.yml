@@ -1,0 +1,427 @@
+name: Build Multiwfn noGUI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: build-nogui-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            gfortran \
+            libflint-dev \
+            libopenblas-dev \
+            pkg-config \
+            patchelf \
+            python3
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBLA_VENDOR=OpenBLAS \
+            -DMULTIWFN_WITH_FD=ON \
+            -DMULTIWFN_GNU_HOT_OPT_LEVEL=O3
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install package and collect runtime libraries
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix package
+          mkdir -p package/lib
+          ldd package/Multiwfn_noGUI \
+            | awk '/=> \// {print $3} $1 ~ /^\// {print $1}' \
+            | sort -u \
+            | while IFS= read -r dependency; do
+                base="$(basename "$dependency")"
+                case "$base" in
+                  libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|ld-linux-*.so.*|libmvec.so.*|librt.so.*|libresolv.so.*|linux-vdso.so.*)
+                    ;;
+                  *)
+                    cp -L "$dependency" package/lib/
+                    ;;
+                esac
+              done
+          for library in package/lib/*.so*; do
+            test -e "$library" || continue
+            patchelf --set-rpath "\$ORIGIN" "$library"
+          done
+          resolved="$(env -u LD_LIBRARY_PATH ldd package/Multiwfn_noGUI)"
+          if grep -q 'not found' <<< "$resolved"; then
+            printf '%s\n' "$resolved" >&2
+            exit 1
+          fi
+          for library in package/lib/*.so*; do
+            test -e "$library" || continue
+            if ! grep -Fq "$PWD/$library" <<< "$resolved"; then
+              echo "Bundled library was not loaded from the package: $library" >&2
+              exit 1
+            fi
+          done
+
+      - name: Test installed package
+        run: |
+          python3 tests/run_nogui_tests.py \
+            "$(pwd)/package/Multiwfn_noGUI" \
+            --settings "$(pwd)/package/settings.ini"
+
+      - name: Archive package
+        run: tar -C package -czf Multiwfn_noGUI-linux-x86_64.tar.gz .
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Multiwfn_noGUI-linux-x86_64
+          path: Multiwfn_noGUI-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  linux_rocky:
+    name: Linux Rocky 8 (glibc 2.28)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    env:
+      ROCKY_IMAGE: "rockylinux/rockylinux:8.10"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Prepare Rocky Linux 8 build container
+        id: rocky
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rocky-fd" "$RUNNER_TEMP/rocky-dnf"
+          docker run --detach --rm --name multiwfn-rocky-build \
+            -v "$PWD:/work" \
+            -v "$RUNNER_TEMP/rocky-fd:/opt/multiwfn-fd" \
+            -v "$RUNNER_TEMP/rocky-dnf:/var/cache/dnf" \
+            -w /work \
+            "$ROCKY_IMAGE" sleep infinity
+          docker exec multiwfn-rocky-build bash -lc '
+              set -euo pipefail
+              cat /etc/rocky-release
+              dnf -y --setopt=keepcache=1 install dnf-plugins-core
+              dnf config-manager --set-enabled powertools \
+                --setopt=powertools.skip_if_unavailable=False
+              dnf -y --setopt=keepcache=1 install epel-release
+              dnf config-manager --set-enabled epel \
+                --setopt=epel.skip_if_unavailable=False
+              dnf repolist --enabled
+              dnf makecache --refresh
+              dnf -y --setopt=keepcache=1 install gcc gcc-gfortran make cmake openblas-devel lapack-devel \
+                binutils findutils patchelf tar gzip xz python3 curl \
+                pkgconf-pkg-config autoconf automake libtool
+            '
+          environment_hash="$(
+            {
+              docker image inspect "$ROCKY_IMAGE" --format '{{.Id}}'
+              docker exec multiwfn-rocky-build rpm -qa | LC_ALL=C sort
+            } | sha256sum | cut -d ' ' -f1
+          )"
+          echo "environment-hash=$environment_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Rocky fractional derivative libraries
+        id: rocky_fd
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/rocky-fd
+          key: rocky-fd-${{ runner.arch }}-${{ steps.rocky.outputs.environment-hash }}-${{ hashFiles('scripts/build_rocky_fd_dependencies.sh') }}
+
+      - name: Build Rocky fractional derivative libraries
+        if: steps.rocky_fd.outputs.cache-hit != 'true'
+        run: docker exec multiwfn-rocky-build bash scripts/build_rocky_fd_dependencies.sh
+
+      - name: Build and package in Rocky Linux 8
+        run: |
+          set -euo pipefail
+          docker exec multiwfn-rocky-build bash -lc '
+              set -euo pipefail
+              fd_prefix=/opt/multiwfn-fd
+              export PKG_CONFIG_PATH="$fd_prefix/lib/pkgconfig:$fd_prefix/lib64/pkgconfig"
+              export LD_LIBRARY_PATH="$fd_prefix/lib:$fd_prefix/lib64"
+              pkg-config --modversion flint
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_PREFIX_PATH="$fd_prefix" \
+                -DBLA_VENDOR=OpenBLAS \
+                -DMULTIWFN_WITH_FD=ON -DMULTIWFN_GNU_HOT_OPT_LEVEL=O3
+              cmake --build build --parallel 4
+              ctest --test-dir build --output-on-failure
+              rm -rf package
+              cmake --install build --prefix package
+              mkdir -p package/lib
+              ldd package/Multiwfn_noGUI \
+                | grep -Eo "/[^[:space:]]+" \
+                | sort -u \
+                | while IFS= read -r dependency; do
+                    base="$(basename "$dependency")"
+                    case "$base" in
+                      libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|ld-linux-*.so.*|libmvec.so.*|librt.so.*|libresolv.so.*|linux-vdso.so.*)
+                        ;;
+                      *)
+                        cp -L "$dependency" package/lib/
+                        ;;
+                    esac
+                  done
+              for library in package/lib/*.so*; do
+                test -e "$library" || continue
+                patchelf --set-rpath "\$ORIGIN" "$library"
+              done
+              if readelf --version-info package/Multiwfn_noGUI package/lib/* 2>/dev/null \
+                | grep -E "GLIBC_2\\.(29|[3-9][0-9])"; then
+                echo "Found GLIBC symbols newer than 2.28" >&2
+                exit 1
+              fi
+              tar -C package -czf Multiwfn_noGUI-linux-glibc228-x86_64.tar.gz .
+            '
+
+      - name: Stop Rocky build container
+        if: always()
+        run: docker stop multiwfn-rocky-build || true
+
+      - name: Test extracted package in a clean Rocky Linux 8 container
+        run: |
+          set -euo pipefail
+          rm -rf release-test
+          mkdir release-test
+          tar -xzf Multiwfn_noGUI-linux-glibc228-x86_64.tar.gz -C release-test
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$RUNNER_TEMP/rocky-dnf:/var/cache/dnf" \
+            -w /work \
+            "$ROCKY_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              dnf --cacheonly -y --setopt=keepcache=1 install python3
+              python3 tests/run_nogui_tests.py \
+                /work/release-test/Multiwfn_noGUI \
+                --settings /work/release-test/settings.ini
+            '
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Multiwfn_noGUI-linux-glibc228-x86_64
+          path: Multiwfn_noGUI-linux-glibc228-x86_64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macOS noGUI (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+            gcc_formula: gcc
+            gcc_major: latest
+          - runner: macos-15-intel
+            architecture: x86_64
+            gcc_formula: gcc@15
+            gcc_major: "15"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/homebrew-cache
+          key: ${{ runner.os }}-${{ matrix.architecture }}-homebrew-${{ hashFiles('.github/workflows/build-nogui.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.architecture }}-homebrew-
+
+      - name: Install build dependencies
+        env:
+          HOMEBREW_CACHE: ${{ runner.temp }}/homebrew-cache
+        run: |
+          brew install flint
+          gcc_formula='${{ matrix.gcc_formula }}'
+          gcc_major='${{ matrix.gcc_major }}'
+          if [[ "$gcc_major" == latest ]]; then
+            brew install "$gcc_formula"
+            gcc_major="$(brew list --versions "$gcc_formula" | awk '{print $2}' | cut -d. -f1)"
+          fi
+          gcc_prefix="$(brew --prefix "$gcc_formula")"
+          fortran_compiler="$gcc_prefix/bin/gfortran-$gcc_major"
+          test -x "$fortran_compiler"
+          runtime_library="$("$gcc_prefix/bin/gcc-$gcc_major" -print-file-name=libemutls_w.a)"
+          test -f "$runtime_library"
+          runtime_library_directory="$(dirname "$runtime_library")"
+          {
+            echo "FC=$fortran_compiler"
+            echo "GCC_ROOT=$gcc_prefix"
+            echo "LIBRARY_PATH=$runtime_library_directory:$gcc_prefix/lib/gcc/$gcc_major:$gcc_prefix/lib"
+            echo "PKG_CONFIG_PATH=$(brew --prefix flint)/lib/pkgconfig:$(brew --prefix gmp)/lib/pkgconfig:$(brew --prefix mpfr)/lib/pkgconfig"
+            if [[ '${{ matrix.architecture }}' == x86_64 ]]; then
+              runtime_library_path="$gcc_prefix/lib/gcc/$gcc_major:$gcc_prefix/lib"
+              echo "DYLD_LIBRARY_PATH=$runtime_library_path"
+            fi
+          } >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_Fortran_COMPILER="$FC" \
+            -DBLA_VENDOR=Apple \
+            -DMULTIWFN_WITH_FD=ON \
+            -DMULTIWFN_GNU_HOT_OPT_LEVEL=O3
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Verify executable architecture
+        run: test "$(lipo -archs build/Multiwfn_noGUI)" = "${{ matrix.architecture }}"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install package and bundle Homebrew libraries
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix package
+          bash scripts/bundle_macos_libraries.sh package/Multiwfn_noGUI \
+            "$GCC_ROOT" \
+            "$(brew --prefix flint)" \
+            "$(brew --prefix gmp)" \
+            "$(brew --prefix mpfr)"
+
+      - name: Test installed package
+        run: |
+          test_python="$(command -v python3)"
+          env -i \
+            PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+            HOME="$HOME" \
+            "$test_python" tests/run_nogui_tests.py \
+            "$(pwd)/package/Multiwfn_noGUI" \
+            --settings "$(pwd)/package/settings.ini"
+
+      - name: Archive package
+        run: tar -C package -czf "Multiwfn_noGUI-macos-${{ matrix.architecture }}.tar.gz" .
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Multiwfn_noGUI-macos-${{ matrix.architecture }}
+          path: Multiwfn_noGUI-macos-${{ matrix.architecture }}.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Windows Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: Set up MSYS2 UCRT64 toolchain
+        uses: msys2/setup-msys2@v2.33.0
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-gcc-fortran
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-openblas
+            mingw-w64-ucrt-x86_64-flint
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBLA_VENDOR=OpenBLAS \
+            -DMULTIWFN_WITH_FD=ON \
+            -DMULTIWFN_GNU_HOT_OPT_LEVEL=O3
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --parallel
+
+      - name: Test in MSYS2
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install package and collect runtime DLLs
+        shell: msys2 {0}
+        run: |
+          cmake --install build --prefix package
+          for pattern in \
+            libgfortran*.dll \
+            libgomp*.dll \
+            libgcc_s_seh-1.dll \
+            libwinpthread-1.dll \
+            libquadmath*.dll \
+            libflint-*.dll \
+            libgmp-*.dll \
+            libmpfr-*.dll \
+            libopenblas*.dll \
+            liblapack*.dll; do
+            for dependency in /ucrt64/bin/$pattern; do
+              if test -f "$dependency"; then
+                cp "$dependency" package/
+              fi
+            done
+          done
+          ldd package/Multiwfn_noGUI.exe \
+            | awk '$3 ~ /^\/ucrt64\/bin\/.*\.dll$/ {print $3}' \
+            | while IFS= read -r dependency; do
+                test -z "$dependency" || cp "$dependency" package/
+              done
+
+      - name: Test installed package outside MSYS2
+        shell: pwsh
+        run: |
+          $env:Path = (($env:Path -split ';' | Where-Object { $_ -notmatch 'msys64' }) -join ';')
+          python tests/run_nogui_tests.py `
+            (Resolve-Path package\Multiwfn_noGUI.exe) `
+            --settings (Resolve-Path package\settings.ini)
+
+      - name: Archive package
+        shell: pwsh
+        run: Compress-Archive -Path package\* -DestinationPath Multiwfn_noGUI-windows-x86_64.zip
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Multiwfn_noGUI-windows-x86_64
+          path: Multiwfn_noGUI-windows-x86_64.zip
+          if-no-files-found: error

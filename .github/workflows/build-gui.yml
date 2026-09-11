@@ -1,0 +1,492 @@
+name: Build Multiwfn GUI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: build-gui-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64 GUI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            ca-certificates \
+            cmake \
+            curl \
+            gfortran \
+            libflint-dev \
+            libgl1-mesa-dev \
+            libglu1-mesa-dev \
+            libmotif-dev \
+            libopenblas-dev \
+            libx11-dev \
+            libxt-dev \
+            pkg-config \
+            patchelf \
+            xauth \
+            xvfb \
+            ninja-build
+
+      - name: Download and install DISLIN 11.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=dislin-11.6.linux.i586_64.tar.gz
+          curl -fL --retry 3 \
+            "https://www.dislin.de/downloads/linux/i586_64/$archive" \
+            -o "$RUNNER_TEMP/$archive"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          installer="$(find "$RUNNER_TEMP" -maxdepth 3 -type f -name INSTALL -print -quit)"
+          test -n "$installer"
+          export DISLIN="$RUNNER_TEMP/dislin"
+          mkdir -p "$DISLIN"
+          (
+            cd "$(dirname "$installer")"
+            ./INSTALL
+          )
+          test -n "$(find "$DISLIN" -type f -print -quit)"
+          test -s "$DISLIN/lib/dislin_d-11.6.a"
+          echo "DISLIN=$DISLIN" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-gui -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBLA_VENDOR=OpenBLAS \
+            -DMULTIWFN_WITH_FD=ON \
+            -DMULTIWFN_BUILD_GUI=ON \
+            -DMULTIWFN_DISLIN_LIBRARY="$DISLIN/lib/dislin_d-11.6.a" \
+            -DMULTIWFN_GNU_HOT_OPT_LEVEL=O3
+
+      - name: Build
+        run: cmake --build build-gui --parallel
+
+      - name: Test DISLIN isosurface with unequal grid dimensions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/suriso-mod"
+          gfortran -J "$RUNNER_TEMP/suriso-mod" -I "$RUNNER_TEMP/suriso-mod" \
+            src/dislin_d.f90 tests/suriso_smoke.f90 \
+            "$DISLIN/lib/dislin_d-11.6.a" -lXm -lXt -lX11 -lGL \
+            -o "$RUNNER_TEMP/suriso-smoke"
+          env -u LD_LIBRARY_PATH xvfb-run -a "$RUNNER_TEMP/suriso-smoke" \
+            "$RUNNER_TEMP/suriso.png"
+          env -u LD_LIBRARY_PATH xvfb-run -a "$RUNNER_TEMP/suriso-smoke" \
+            "$RUNNER_TEMP/suriso-baseline.png" baseline
+          test -s "$RUNNER_TEMP/suriso.png"
+          test -s "$RUNNER_TEMP/suriso-baseline.png"
+          if cmp -s "$RUNNER_TEMP/suriso.png" "$RUNNER_TEMP/suriso-baseline.png"; then
+            echo 'SURISO did not change the image' >&2
+            exit 1
+          fi
+
+      - name: Package and collect runtime libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --install build-gui --prefix package
+          mkdir -p package/lib
+          dependencies="$(ldd package/Multiwfn)"
+          if printf '%s\n' "$dependencies" | grep -q 'not found'; then
+            printf '%s\n' "$dependencies"
+            exit 1
+          fi
+          printf '%s\n' "$dependencies" \
+            | awk '/=> \// {print $3} $1 ~ /^\// {print $1}' \
+            | sort -u \
+            | while IFS= read -r dependency; do
+                base="$(basename "$dependency")"
+                case "$base" in
+                  libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|ld-linux-*.so.*|libmvec.so.*|librt.so.*|libresolv.so.*|linux-vdso.so.*)
+                    ;;
+                  *)
+                    cp -L "$dependency" package/lib/
+                    ;;
+                esac
+              done
+          for library in package/lib/*.so*; do
+            test -e "$library" || continue
+            patchelf --set-rpath "\$ORIGIN" "$library"
+          done
+          resolved="$(env -u LD_LIBRARY_PATH ldd package/Multiwfn)"
+          if grep -q 'not found' <<< "$resolved"; then
+            printf '%s\n' "$resolved" >&2
+            exit 1
+          fi
+          for library in package/lib/*.so*; do
+            test -e "$library" || continue
+            if ! grep -Fq "$PWD/$library" <<< "$resolved"; then
+              echo "Bundled library was not loaded from the package: $library" >&2
+              exit 1
+            fi
+          done
+          cp -R "$DISLIN" package/dislin
+          mv package/Multiwfn package/Multiwfn.bin
+          cat > package/Multiwfn <<'EOF'
+          #!/bin/sh
+          HERE=$(CDPATH= cd "$(dirname "$0")" && pwd)
+          export DISLIN="$HERE/dislin"
+          exec "$HERE/Multiwfn.bin" "$@"
+          EOF
+          chmod +x package/Multiwfn
+          cat > "$RUNNER_TEMP/gui-smoke.xyz" <<'EOF'
+          1
+          helium
+          He 0 0 0
+          EOF
+          cd package
+          printf 'q\n' | env -i \
+            PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+            HOME="$HOME" \
+            OMP_STACKSIZE=64M \
+            OPENBLAS_NUM_THREADS=1 \
+            xvfb-run -a ./Multiwfn "$RUNNER_TEMP/gui-smoke.xyz"
+          tar -czf ../Multiwfn_GUI-linux-x86_64.tar.gz .
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Multiwfn_GUI-linux-x86_64
+          path: Multiwfn_GUI-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64 GUI (MinGW UCRT64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up MSYS2 UCRT64 toolchain
+        uses: msys2/setup-msys2@v2.33.0
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-gcc-fortran
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-openblas
+            mingw-w64-ucrt-x86_64-flint
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Download the MinGW DISLIN library
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest `
+            -Uri 'https://www.dislin.de/downloads/win64/dl_11_mg.zip' `
+            -OutFile dislin.zip
+          Expand-Archive -Path dislin.zip -DestinationPath dislin -Force
+          $library = Get-ChildItem -Path dislin -Filter dismgu_d.a -Recurse |
+            Select-Object -First 1
+          if ($null -eq $library) {
+            throw 'The DISLIN archive did not contain dismgu_d.a'
+          }
+          "MULTIWFN_DISLIN_LIBRARY=$($library.FullName.Replace('\', '/'))" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          dislin_library="$(cygpath -u "$MULTIWFN_DISLIN_LIBRARY")"
+          cmake -S . -B build-gui -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBLA_VENDOR=OpenBLAS \
+            -DMULTIWFN_WITH_FD=ON \
+            -DMULTIWFN_BUILD_GUI=ON \
+            -DMULTIWFN_DISLIN_LIBRARY="$dislin_library" \
+            -DMULTIWFN_GNU_HOT_OPT_LEVEL=O3
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build-gui --parallel
+
+      - name: Package and collect runtime DLLs
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake --install build-gui --prefix package
+          dependencies="$(ldd package/Multiwfn.exe)"
+          if printf '%s\n' "$dependencies" | grep -qi 'not found'; then
+            printf '%s\n' "$dependencies"
+            exit 1
+          fi
+          printf '%s\n' "$dependencies" \
+            | awk '$1 ~ /^\/ucrt64\/bin\/.*\.dll$/ {print $1} \
+                   $3 ~ /^\/ucrt64\/bin\/.*\.dll$/ {print $3}' \
+            | sort -u \
+            | while IFS= read -r dependency; do
+                cp "$dependency" package/
+              done
+          for pattern in libflint-*.dll libgmp-*.dll libmpfr-*.dll; do
+            for dependency in /ucrt64/bin/$pattern; do
+              if test -f "$dependency"; then
+                cp "$dependency" package/
+              fi
+            done
+          done
+      - name: Archive package
+        shell: pwsh
+        run: Compress-Archive -Path package\* -DestinationPath Multiwfn_GUI-windows-x86_64.zip
+
+      - name: Test extracted package outside MSYS2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:RUNNER_TEMP 'multiwfn-gui-package-smoke'
+          Expand-Archive Multiwfn_GUI-windows-x86_64.zip -DestinationPath $package
+          $xyz = Join-Path $package 'smoke.xyz'
+          $inputFile = Join-Path $env:RUNNER_TEMP 'multiwfn-gui-smoke.in'
+          $outputFile = Join-Path $env:RUNNER_TEMP 'multiwfn-gui-smoke.out'
+          $errorFile = Join-Path $env:RUNNER_TEMP 'multiwfn-gui-smoke.err'
+          Set-Content $xyz @('1', 'helium', 'He 0 0 0') -Encoding ascii
+          Set-Content $inputFile 'q' -Encoding ascii
+          $env:Path = (($env:Path -split ';') | Where-Object { $_ -notmatch 'msys64' }) -join ';'
+          Remove-Item Env:DISLIN -ErrorAction SilentlyContinue
+          $process = Start-Process -FilePath (Join-Path $package 'Multiwfn.exe') `
+            -ArgumentList "`"$xyz`"" -WorkingDirectory $package `
+            -RedirectStandardInput $inputFile -RedirectStandardOutput $outputFile `
+            -RedirectStandardError $errorFile -NoNewWindow -PassThru
+          if (-not $process.WaitForExit(30000)) {
+            $process.Kill()
+            throw 'The packaged GUI executable did not exit within 30 seconds'
+          }
+          if ($process.ExitCode -ne 0 -or (Get-Content $outputFile -Raw) -notmatch 'Loaded .+ successfully!') {
+            Get-Content $outputFile, $errorFile
+            throw 'The packaged GUI executable failed to load the smoke input'
+          }
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Multiwfn_GUI-windows-x86_64
+          path: Multiwfn_GUI-windows-x86_64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS GUI (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+            dislin_architecture: arm
+            gcc_formula: gcc
+            gcc_major: latest
+          - runner: macos-15-intel
+            architecture: x86_64
+            dislin_architecture: intel
+            gcc_formula: gcc@15
+            gcc_major: "15"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/homebrew-cache
+          key: ${{ runner.os }}-${{ matrix.architecture }}-homebrew-gui-${{ hashFiles('.github/workflows/build-gui.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.architecture }}-homebrew-gui-
+
+      - name: Install build dependencies
+        env:
+          HOMEBREW_CACHE: ${{ runner.temp }}/homebrew-cache
+        run: |
+          cmake --version
+          ninja --version
+          if [[ '${{ matrix.architecture }}' == x86_64 ]]; then
+            brew install --build-from-source pkgconf libx11
+          else
+            brew install pkgconf libx11
+          fi
+          brew install flint libxt openmotif
+          gcc_formula='${{ matrix.gcc_formula }}'
+          gcc_major='${{ matrix.gcc_major }}'
+          if [[ "$gcc_major" == latest ]]; then
+            brew install "$gcc_formula"
+            gcc_major="$(brew list --versions "$gcc_formula" | awk '{print $2}' | cut -d. -f1)"
+          fi
+          gcc_prefix="$(brew --prefix "$gcc_formula")"
+          test -x "$gcc_prefix/bin/gcc-$gcc_major"
+          test -x "$gcc_prefix/bin/gfortran-$gcc_major"
+          runtime_library="$("$gcc_prefix/bin/gcc-$gcc_major" -print-file-name=libemutls_w.a)"
+          test -f "$runtime_library"
+          runtime_library_directory="$(dirname "$runtime_library")"
+          {
+            echo "GCC_ROOT=$gcc_prefix"
+            echo "CC=$gcc_prefix/bin/gcc-$gcc_major"
+            echo "FC=$gcc_prefix/bin/gfortran-$gcc_major"
+            echo "LIBRARY_PATH=$runtime_library_directory:$gcc_prefix/lib/gcc/$gcc_major:$gcc_prefix/lib"
+            echo "PKG_CONFIG_PATH=$(brew --prefix flint)/lib/pkgconfig:$(brew --prefix gmp)/lib/pkgconfig:$(brew --prefix mpfr)/lib/pkgconfig"
+            if [[ '${{ matrix.architecture }}' == x86_64 ]]; then
+              runtime_library_path="$gcc_prefix/lib/gcc/$gcc_major:$gcc_prefix/lib"
+              echo "DYLD_LIBRARY_PATH=$runtime_library_path"
+            fi
+          } >> "$GITHUB_ENV"
+
+      - name: Download and install DISLIN
+        run: |
+          set -euo pipefail
+          archive="dislin-11.6.macOS.${{ matrix.dislin_architecture }}.64.tar.gz"
+          curl -fL --retry 3 \
+            "https://www.dislin.de/downloads/macOS/$archive" \
+            -o "$RUNNER_TEMP/$archive"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          export DISLIN="$RUNNER_TEMP/dislin"
+          mkdir -p "$DISLIN"
+          (
+            cd "$RUNNER_TEMP/dislin-11.6"
+            ./INSTALL
+          )
+          test -f "$DISLIN/libdislin_d.dylib"
+          install_name_tool -id "$DISLIN/libdislin_d.dylib" \
+            "$DISLIN/libdislin_d.dylib"
+          echo "DISLIN=$DISLIN" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-gui -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_Fortran_COMPILER="$FC" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix libx11);$(brew --prefix libxt);$(brew --prefix openmotif)" \
+            -DBLA_VENDOR=Apple \
+            -DMULTIWFN_WITH_FD=ON \
+            -DMULTIWFN_BUILD_GUI=ON \
+            -DMULTIWFN_DISLIN_LIBRARY="$DISLIN/libdislin_d.dylib" \
+            -DMULTIWFN_GNU_HOT_OPT_LEVEL=O3
+
+      - name: Build
+        run: cmake --build build-gui --parallel
+
+      - name: Verify executable architecture
+        run: test "$(lipo -archs build-gui/Multiwfn)" = "${{ matrix.architecture }}"
+
+      - name: Test BLAS and LAPACK numerical results
+        run: ctest --test-dir build-gui --output-on-failure
+
+      - name: Install package and bundle dynamic libraries
+        run: |
+          set -euo pipefail
+          cmake --install build-gui --prefix package
+          bash scripts/bundle_macos_libraries.sh package/Multiwfn \
+            "$GCC_ROOT" \
+            "$(brew --prefix flint)" \
+            "$(brew --prefix gmp)" \
+            "$(brew --prefix mpfr)" \
+            "$(brew --prefix libx11)" \
+            "$(brew --prefix libxt)" \
+            "$(brew --prefix openmotif)" \
+            "$DISLIN"
+          cp -R "$DISLIN" package/dislin
+          dislin_copy="$(mktemp package/dislin/libdislin_d.XXXXXX)"
+          cp -L "$DISLIN/libdislin_d.dylib" "$dislin_copy"
+          chmod 755 "$dislin_copy"
+          mv -f "$dislin_copy" package/dislin/libdislin_d.dylib
+          codesign --force --sign - package/dislin/libdislin_d.dylib
+          codesign --verify package/dislin/libdislin_d.dylib
+          mv package/Multiwfn package/Multiwfn.bin
+          cat > package/Multiwfn <<'EOF'
+          #!/bin/sh
+          HERE=$(CDPATH= cd "$(dirname "$0")" && pwd)
+          export DISLIN="$HERE/dislin"
+          exec "$HERE/Multiwfn.bin" "$@"
+          EOF
+          chmod +x package/Multiwfn
+
+      - name: Archive package
+        run: tar -C package -czf "Multiwfn_GUI-macos-${{ matrix.architecture }}.tar.gz" .
+
+      - name: Test extracted package dependencies and startup
+        run: |
+          set -euo pipefail
+          extracted="$RUNNER_TEMP/multiwfn-gui-package-smoke"
+          mkdir -p "$extracted"
+          tar -xzf "Multiwfn_GUI-macos-${{ matrix.architecture }}.tar.gz" -C "$extracted"
+          test -x "$extracted/Multiwfn"
+          test -x "$extracted/Multiwfn.bin"
+          test -f "$extracted/dislin/libdislin_d.dylib"
+          dependencies="$(otool -L "$extracted/Multiwfn.bin" "$extracted"/lib/* | awk '/^[[:space:]]+/ {print $1}')"
+          if grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/' <<< "$dependencies" \
+            || grep -F "$RUNNER_TEMP" <<< "$dependencies"; then
+            echo 'Extracted package refers to a build-machine library path' >&2
+            exit 1
+          fi
+
+          brew install --cask xquartz
+          test -x /opt/X11/bin/Xvfb
+          sudo install -d -m 1777 /tmp/.X11-unix
+          /opt/X11/bin/Xvfb :99 -screen 0 1280x1024x24 \
+            > "$RUNNER_TEMP/multiwfn-xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" 2>/dev/null || true' EXIT
+          for _ in {1..20}; do
+            if DISPLAY=:99 /opt/X11/bin/xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+          if ! DISPLAY=:99 /opt/X11/bin/xdpyinfo >/dev/null 2>&1; then
+            cat "$RUNNER_TEMP/multiwfn-xvfb.log" >&2
+            exit 1
+          fi
+
+          python3 - "$extracted" "$RUNNER_TEMP" <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          package = Path(sys.argv[1])
+          xyz = Path(sys.argv[2]) / "multiwfn-gui-smoke.xyz"
+          xyz.write_text("1\nhelium\nHe 0 0 0\n", encoding="ascii")
+          environment = {
+              "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+              "HOME": os.environ["HOME"],
+              "DISPLAY": ":99",
+              "OMP_STACKSIZE": "64M",
+              "OPENBLAS_NUM_THREADS": "1",
+          }
+          result = subprocess.run(
+              [str(package / "Multiwfn"), str(xyz)],
+              input="q\n", text=True, capture_output=True,
+              cwd=package, env=environment, timeout=30,
+          )
+          if result.returncode != 0 or not re.search(r"Loaded .+ successfully!", result.stdout):
+              print(result.stdout)
+              print(result.stderr, file=sys.stderr)
+              raise SystemExit("Extracted macOS GUI package failed to load the smoke input")
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Multiwfn_GUI-macos-${{ matrix.architecture }}
+          path: Multiwfn_GUI-macos-${{ matrix.architecture }}.tar.gz
+          if-no-files-found: error

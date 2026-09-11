@@ -1,0 +1,123 @@
+name: Sync Multiwfn source
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  sync:
+    name: Synchronize source archive
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      default_branch: ${{ steps.commit.outputs.default_branch }}
+      source_version: ${{ steps.commit.outputs.source_version }}
+      source_sha: ${{ steps.commit.outputs.source_sha }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: Test source synchronization
+        run: python3 -m unittest discover -s tests -p test_sync.py
+
+      - name: Synchronize the upstream source
+        run: python3 sync_multiwfn.py
+
+      - name: Commit synchronized source
+        id: commit
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+          version="$(python3 -c 'import json; print(json.load(open("upstream.json", encoding="utf-8"))["source_version"])')"
+          source_sha="$(python3 -c 'import json; print(json.load(open("upstream.json", encoding="utf-8"))["download_sha256"])')"
+          echo "source_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+
+          if git diff --quiet -- src upstream.json; then
+            echo "No upstream changes detected."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src upstream.json
+          git commit -m "Sync Multiwfn source ${version}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+
+  dispatch_release:
+    name: Dispatch release if this source archive is not published
+    needs: sync
+    if: needs.sync.result == 'success'
+    runs-on: ubuntu-26.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check for an existing release or active build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ needs.sync.outputs.default_branch }}
+          SOURCE_VERSION: ${{ needs.sync.outputs.source_version }}
+          SOURCE_SHA: ${{ needs.sync.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$SOURCE_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{64}$ ]]
+          release_tag="v${SOURCE_VERSION}-${SOURCE_SHA}"
+          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}"
+
+          release_status="$(curl --silent --show-error --retry 3 \
+            --output "$RUNNER_TEMP/release.json" --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            "${api}/releases/tags/${release_tag}")"
+          if [[ "$release_status" == 200 ]]; then
+            expected_assets='["Multiwfn_noGUI-linux-x86_64.tar.gz","Multiwfn_noGUI-linux-glibc228-x86_64.tar.gz","Multiwfn_noGUI-macos-arm64.tar.gz","Multiwfn_noGUI-macos-x86_64.tar.gz","Multiwfn_noGUI-windows-x86_64.zip","Multiwfn_GUI-linux-x86_64.tar.gz","Multiwfn_GUI-macos-arm64.tar.gz","Multiwfn_GUI-macos-x86_64.tar.gz","Multiwfn_GUI-windows-x86_64.zip","SHA256SUMS.txt"]'
+            if jq -e --argjson expected "$expected_assets" \
+                '([.assets[].name] | sort) == ($expected | sort)' \
+                "$RUNNER_TEMP/release.json" >/dev/null; then
+              echo "Release ${release_tag} already contains all expected packages."
+              exit 0
+            fi
+            echo "Release ${release_tag} is incomplete; dispatching a repair build."
+          elif [[ "$release_status" != 404 ]]; then
+            cat "$RUNNER_TEMP/release.json" >&2
+            echo "GitHub returned HTTP ${release_status} while checking releases." >&2
+            exit 1
+          fi
+
+          runs="$(curl --fail-with-body --silent --show-error --retry 3 \
+            --get \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --data-urlencode "branch=${DEFAULT_BRANCH}" \
+            --data-urlencode 'event=workflow_dispatch' \
+            --data-urlencode 'per_page=50' \
+            "${api}/actions/workflows/release.yml/runs")"
+          if jq -e --arg name 'Publish Multiwfn release' \
+              '.workflow_runs | any(.[]; .name == $name and .status != "completed")' \
+              <<< "$runs" >/dev/null; then
+            echo 'A release workflow is already running; the next daily check will retry if needed.'
+            exit 0
+          fi
+
+          payload="$(jq -n --arg ref "$DEFAULT_BRANCH" '{ref: $ref}')"
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/dispatches" \
+            --data-binary "$payload"
