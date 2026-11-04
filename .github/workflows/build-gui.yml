@@ -313,18 +313,56 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.architecture }}-homebrew-gui-
 
-      - name: Install build dependencies
+      - name: Identify Intel dependency environment
+        if: matrix.architecture == 'x86_64'
+        id: intel-environment
+        run: echo "os=$(sw_vers -buildVersion)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore installed MacPorts dependencies
+        if: matrix.architecture == 'x86_64'
+        id: macports-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/macports-dependencies.tar.gz
+          key: macOS-x86_64-macports-${{ steps.intel-environment.outputs.os }}-${{ hashFiles('scripts/setup_macos_intel_dependencies.sh') }}
+
+      - name: Install Intel binary dependencies
+        if: matrix.architecture == 'x86_64'
+        run: bash scripts/setup_macos_intel_dependencies.sh "$RUNNER_TEMP/macports-dependencies.tar.gz"
+
+      - name: Cache installed MacPorts dependencies
+        if: matrix.architecture == 'x86_64' && steps.macports-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/macports-dependencies.tar.gz
+          key: ${{ steps.macports-cache.outputs.cache-primary-key }}
+
+      - name: Install Homebrew build dependencies
         env:
           HOMEBREW_CACHE: ${{ runner.temp }}/homebrew-cache
         run: |
+          if [[ '${{ matrix.architecture }}' == arm64 ]]; then
+            brew install pkgconf libx11 flint libxt openmotif
+          else
+            brew install flint
+          fi
+
+      - name: Configure dependency and compiler paths
+        run: |
+          set -euo pipefail
           cmake --version
           ninja --version
           if [[ '${{ matrix.architecture }}' == x86_64 ]]; then
-            brew install --build-from-source pkgconf libx11
+            {
+              echo 'GUI_CMAKE_PREFIX_PATH=/opt/local'
+              echo 'GUI_PKG_CONFIG=/opt/local/bin/pkg-config'
+            } >> "$GITHUB_ENV"
           else
-            brew install pkgconf libx11
+            {
+              echo "GUI_CMAKE_PREFIX_PATH=$(brew --prefix libx11);$(brew --prefix libxt);$(brew --prefix openmotif)"
+              echo "GUI_PKG_CONFIG=$(brew --prefix pkgconf)/bin/pkg-config"
+            } >> "$GITHUB_ENV"
           fi
-          brew install flint libxt openmotif
           gcc_formula='${{ matrix.gcc_formula }}'
           gcc_major='${{ matrix.gcc_major }}'
           if [[ "$gcc_major" == latest ]]; then
@@ -374,7 +412,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="$CC" \
             -DCMAKE_Fortran_COMPILER="$FC" \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix libx11);$(brew --prefix libxt);$(brew --prefix openmotif)" \
+            -DCMAKE_PREFIX_PATH="$GUI_CMAKE_PREFIX_PATH" \
+            -DPKG_CONFIG_EXECUTABLE="$GUI_PKG_CONFIG" \
             -DBLA_VENDOR=Apple \
             -DMULTIWFN_WITH_FD=ON \
             -DMULTIWFN_BUILD_GUI=ON \
@@ -394,15 +433,23 @@ jobs:
         run: |
           set -euo pipefail
           cmake --install build-gui --prefix package
+          dependency_roots=(
+            "$(brew --prefix flint)"
+            "$(brew --prefix gmp)"
+            "$(brew --prefix mpfr)"
+          )
+          if [[ '${{ matrix.architecture }}' == x86_64 ]]; then
+            dependency_roots+=(/opt/local)
+          else
+            dependency_roots+=(
+              "$(brew --prefix libx11)"
+              "$(brew --prefix libxt)"
+              "$(brew --prefix openmotif)"
+              "$(brew --prefix brotli)"
+            )
+          fi
           bash scripts/bundle_macos_libraries.sh package/Multiwfn \
-            "$GCC_ROOT" \
-            "$(brew --prefix flint)" \
-            "$(brew --prefix gmp)" \
-            "$(brew --prefix mpfr)" \
-            "$(brew --prefix libx11)" \
-            "$(brew --prefix libxt)" \
-            "$(brew --prefix openmotif)" \
-            "$DISLIN"
+            "$GCC_ROOT" "${dependency_roots[@]}" "$DISLIN"
           cp -R "$DISLIN" package/dislin
           dislin_copy="$(mktemp package/dislin/libdislin_d.XXXXXX)"
           cp -L "$DISLIN/libdislin_d.dylib" "$dislin_copy"
@@ -432,7 +479,7 @@ jobs:
           test -x "$extracted/Multiwfn.bin"
           test -f "$extracted/dislin/libdislin_d.dylib"
           dependencies="$(otool -L "$extracted/Multiwfn.bin" "$extracted"/lib/* | awk '/^[[:space:]]+/ {print $1}')"
-          if grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/' <<< "$dependencies" \
+          if grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/|/opt/local/' <<< "$dependencies" \
             || grep -F "$RUNNER_TEMP" <<< "$dependencies"; then
             echo 'Extracted package refers to a build-machine library path' >&2
             exit 1

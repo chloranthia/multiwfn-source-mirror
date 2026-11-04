@@ -40,6 +40,12 @@ library. Linux and macOS also require X11, Xt, Motif, and OpenGL development
 files. Platform setup examples are in the [CI workflows](.github/workflows/);
 upstream build instructions remain in [src/COMPILATION_METHOD.txt](src/COMPILATION_METHOD.txt).
 
+macOS Intel GUI CI uses pinned MacPorts binaries for X11/Motif and caches the
+installed libraries; missing binaries fail the job. Dependency pins are maintained
+in [`scripts/setup_macos_intel_dependencies.sh`](scripts/setup_macos_intel_dependencies.sh).
+ARM64 GUI CI uses Homebrew. Both architectures use Homebrew FLINT/GMP/MPFR
+and retain their existing GCC toolchains.
+
 The CMake installation includes the executable, settings, license, and build
 metadata. CI packaging also bundles runtime libraries and GUI resources.
 

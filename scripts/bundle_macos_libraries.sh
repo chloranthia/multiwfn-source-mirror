@@ -124,7 +124,7 @@ bundle_binary() {
         ;;
     esac
     if ! resolved="$(resolve_dependency "$dependency" "$binary")"; then
-      echo "Unable to resolve non-system macOS dependency: $dependency" >&2
+      echo "Unable to resolve non-system macOS dependency in $binary: $dependency" >&2
       return 1
     fi
     name="${resolved##*/}"
@@ -143,8 +143,8 @@ bundle_binary() {
 
 bundle_binary "$entry_binary"
 if otool -L "$entry_binary" "$bundle_dir"/* |
-  grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/'; then
-  echo 'Bundled package still refers to Homebrew paths' >&2
+  grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/|/opt/local/'; then
+  echo 'Bundled package still refers to package-manager paths' >&2
   exit 1
 fi
 
